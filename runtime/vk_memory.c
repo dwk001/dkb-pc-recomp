@@ -88,6 +88,7 @@ static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT r
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
 static int32_t n_imports, n_import_failures;
+static volatile int64_t import_ns, import_alone_ns, import_alone_n;   // time in the driver for imports: all, and those no other import overlapped
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
@@ -152,8 +153,16 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
-    if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
-        (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+    static volatile int32_t importing;
+    int others = __atomic_add_fetch(&importing, 1, __ATOMIC_RELAXED) > 1;
+    uint64_t t_imp = kern_now_ns();
+    res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+    if (res == VK_SUCCESS) res = vkBindBufferMemory(c->device, r->buf, r->mem, 0);
+    t_imp = kern_now_ns() - t_imp;
+    int left = __atomic_sub_fetch(&importing, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&import_ns, (int64_t)t_imp, __ATOMIC_RELAXED);
+    if (!others && !left) __atomic_add_fetch(&import_alone_ns, (int64_t)t_imp, __ATOMIC_RELAXED), __atomic_add_fetch(&import_alone_n, 1, __ATOMIC_RELAXED);
+    if (res != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -628,7 +637,7 @@ void vk_mem_census(uint64_t frame) {
     }
     // Frame 600 as well: runs on slow machines end before 1800.
     if (frame != 600 && (frame % 1800 || !(frame == 1800 || (rt_trace & RT_TRACE_PERF)))) return;
-    typedef struct { int kind; uint32_t flags; uint64_t n, bytes; } Group;
+    typedef struct { int kind; uint32_t flags; uint64_t n, bytes, used; } Group;
     Group g[64];
     int ng = 0;
     uint64_t total[4] = {0}, count[4] = {0};
@@ -637,8 +646,8 @@ void vk_mem_census(uint64_t frame) {
         const PoolRec *r = pool_index.e[i].buf;
         int j = 0;
         while (j < ng && (g[j].kind != r->kind || g[j].flags != r->flags)) j++;
-        if (j == ng && ng < 64) g[ng++] = (Group){r->kind, r->flags, 0, 0};
-        if (j < ng) g[j].n++, g[j].bytes += r->size;
+        if (j == ng && ng < 64) g[ng++] = (Group){r->kind, r->flags, 0, 0, 0};
+        if (j < ng) g[j].n++, g[j].bytes += r->size, g[j].used += r->used != 0;
         total[r->kind] += r->size, count[r->kind]++;
     }
     plat_mutex_unlock_shared(&pool_lock);
@@ -647,12 +656,15 @@ void vk_mem_census(uint64_t frame) {
            (unsigned long long)frame, (unsigned long long)count[POOL_IMPORT], total[POOL_IMPORT] / 1048576.0,
            n_import_failures, (unsigned long long)count[POOL_PHYS], total[POOL_PHYS] / 1048576.0,
            (unsigned long long)count[POOL_VIRT], total[POOL_VIRT] / 1048576.0);
+    rt_log("mem: host memory imports: %d, %.0f ms in the driver (average %.1f ms); %lld with no other import running, "
+           "average %.1f ms", n_imports, (double)import_ns / 1e6, n_imports ? (double)import_ns / 1e6 / n_imports : 0.0,
+           (long long)import_alone_n, import_alone_n ? (double)import_alone_ns / 1e6 / (double)import_alone_n : 0.0);
     static const char *const kinds[] = {"", "import", "physical", "virtual"};
     for (int j = 0; j < ng; j++) {
         char f[160];
         flag_names(g[j].flags, f, sizeof f);
-        rt_log("mem:   %s %#x %s: %llu pools, %.1f MiB", kinds[g[j].kind], g[j].flags, f, (unsigned long long)g[j].n,
-               g[j].bytes / 1048576.0);
+        rt_log("mem:   %s %#x %s: %llu pools (%llu used by the GPU so far), %.1f MiB", kinds[g[j].kind], g[j].flags, f,
+               (unsigned long long)g[j].n, (unsigned long long)g[j].used, g[j].bytes / 1048576.0);
     }
     uint64_t frames = window_start && frame > window_start ? frame - window_start : frame;
     static const char *const cls[] = {"", "host CPU_NO_ACCESS", "host CPU_UNCACHED", "host CPU_CACHED", "device", "scratch"};
