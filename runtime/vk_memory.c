@@ -46,6 +46,7 @@ typedef struct PoolRec {
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
     uint64_t npages;
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
+    volatile int32_t istate;              // POOL_IMPORT: 0 imported (or not an import), 1 import not done yet, 2 being imported
     // TOTK_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
@@ -249,6 +250,119 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     free(r);
 }
 
+// ---- lazy host memory imports
+// Importing a pool's guest memory as host memory takes the driver 3 to 6 ms per pool however small it is, and the GPU uses
+// only about a quarter of the pools a game creates: a first-area run made 3,299 imports, 20 s in the driver, with up to six
+// guest threads inside MemoryPoolInitialize at once. So vk_pool_init only records an import pool (istate 1). The first
+// thread that needs its buffer imports it (pool_settle_locked); with DKB_LAZY_IMPORT=2 workers (DKB_IMPORT_WORKERS, 3) also
+// import pools of CPU-cached memory, the kind the GPU uses about half of, ahead of that, and 3 every pool the CPU can reach.
+// DKB_LAZY_IMPORT=0 (the default) imports in vk_pool_init as before.
+// A thread claims a pool (istate 1 -> 2) while it holds pool_lock shared, so vk_pool_fini, which needs the lock exclusively to
+// take the pool out of the index, finds 2 and waits for the import before it frees the record.
+static PlatMutex imp_lock = PLAT_MUTEX_INIT;
+static PlatCond imp_cond = PLAT_COND_INIT;
+typedef struct { uint64_t lo, serial; } ImpJob;
+static ImpJob *imp_q;
+static size_t imp_head, imp_n, imp_cap;
+static int imp_workers, imp_workers_max = -1;   // DKB_IMPORT_WORKERS, default 3
+
+static int lazy_import_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DKB_LAZY_IMPORT");
+        mode = e && *e ? atoi(e) : 0;   // off by default: see the measurements in docs/dkb-testing.md
+        if (mode < 0 || mode > 3) mode = 0;
+    }
+    return mode;
+}
+
+static void pool_import_wait(void) {   // for any import to finish; the caller looks again
+    plat_mutex_lock(&imp_lock);
+    plat_cond_wait_ns(&imp_cond, &imp_lock, 2000000);
+    plat_mutex_unlock(&imp_lock);
+}
+
+// r->istate is 2, claimed by the caller, who holds no lock. Nothing touches r after the state is published.
+static void pool_materialize(PoolRec *r) {
+    VkCtx *c = vk_ctx();
+    double t0 = (double)plat_now_ms();
+    mem_thaw(r->lo, r->size);   // the import may need write access to the pages
+    int ok = c && import_pool(c, r, r->lo, r->size);
+    if (!ok) {
+        // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
+        long n = plat_inc32(&n_import_failures);
+        if (n <= 8) rt_log("vk: pool %p (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (void *)(uintptr_t)r->lo,
+                           r->flags, (unsigned long long)r->size, n);
+        r->buf = VK_NULL_HANDLE;
+    }
+    double took = (double)plat_now_ms() - t0;
+    if (took >= 20.0)
+        rt_log("vk: pool import took %.0f ms: imported host memory pool of %llu MiB (flags %#x)", took,
+               (unsigned long long)(r->size >> 20), r->flags);
+    __atomic_store_n(&r->istate, 0, __ATOMIC_RELEASE);
+    plat_mutex_lock(&imp_lock);
+    plat_cond_broadcast(&imp_cond);
+    plat_mutex_unlock(&imp_lock);
+}
+
+// The caller holds pool_lock shared and found r in the index. 0: r can be used. Otherwise the lock has been released and
+// the import done (or awaited) here: the caller looks the pool up again.
+static int pool_settle_locked(PoolRec *r) {
+    if (r->kind != POOL_IMPORT || !__atomic_load_n(&r->istate, __ATOMIC_ACQUIRE)) return 0;
+    int32_t one = 1;
+    int claimed = __atomic_compare_exchange_n(&r->istate, &one, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    plat_mutex_unlock_shared(&pool_lock);
+    if (claimed) pool_materialize(r);
+    else pool_import_wait();
+    return 1;
+}
+
+static void imp_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        plat_mutex_lock(&imp_lock);
+        while (imp_head == imp_n) plat_cond_wait_ns(&imp_cond, &imp_lock, 100000000);
+        ImpJob j = imp_q[imp_head++];
+        if (imp_head == imp_n) imp_head = imp_n = 0;
+        plat_mutex_unlock(&imp_lock);
+        PoolRec *r = NULL;
+        int claimed = 0;
+        plat_mutex_lock_shared(&pool_lock);
+        const pidx_ent *e = pidx_find(&pool_index, j.lo, 1);
+        if (e && e->buf && ((PoolRec *)e->buf)->kind == POOL_IMPORT && ((PoolRec *)e->buf)->storage_serial == j.serial) {
+            r = e->buf;
+            int32_t one = 1;
+            claimed = __atomic_compare_exchange_n(&r->istate, &one, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+        if (claimed) pool_materialize(r);
+    }
+}
+
+static void import_prefetch(uint64_t lo, uint64_t serial) {
+    plat_mutex_lock(&imp_lock);
+    if (imp_n == imp_cap) {
+        size_t cap = imp_cap ? imp_cap * 2 : 1024;
+        ImpJob *t = realloc(imp_q, cap * sizeof *t);
+        if (!t) {
+            plat_mutex_unlock(&imp_lock);
+            return;
+        }
+        imp_q = t, imp_cap = cap;
+    }
+    imp_q[imp_n++] = (ImpJob){lo, serial};
+    if (imp_workers_max < 0) {
+        const char *e = getenv("DKB_IMPORT_WORKERS");
+        imp_workers_max = e && *e ? atoi(e) : 3;
+        if (imp_workers_max < 1 || imp_workers_max > 8) imp_workers_max = 3;
+    }
+    int start = imp_workers < imp_workers_max;
+    if (start) imp_workers++;
+    plat_cond_broadcast(&imp_cond);
+    plat_mutex_unlock(&imp_lock);
+    if (start) plat_thread_spawn(imp_worker, NULL, "pool import", 0);
+}
+
 int vk_pool_init(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) { rt_log("vk: MemoryPoolInitialize before vk_init"); return 0; }
@@ -281,15 +395,20 @@ int vk_pool_init(pool_t *p) {
         ok = alloc_physical(c, r);
     } else {
         r->kind = POOL_IMPORT;
-        mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
-        ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
-        if (!ok) {
-            // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
-            long n = plat_inc32(&n_import_failures);
-            if (n <= 8) rt_log("vk: pool %p (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (void *)p->mem,
-                               p->flags, (unsigned long long)p->size, n);
-            r->buf = VK_NULL_HANDLE;
+        if (lazy_import_mode()) {
+            r->istate = 1;   // imported when the GPU first needs it (see "lazy host memory imports")
             ok = 1;
+        } else {
+            mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
+            ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+            if (!ok) {
+                // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
+                long n = plat_inc32(&n_import_failures);
+                if (n <= 8) rt_log("vk: pool %p (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (void *)p->mem,
+                                   p->flags, (unsigned long long)p->size, n);
+                r->buf = VK_NULL_HANDLE;
+                ok = 1;
+            }
         }
     }
     double took = (double)plat_now_ms() - t0;
@@ -310,7 +429,12 @@ int vk_pool_init(pool_t *p) {
         }
         phys_list[nphys++] = r;
     }
+    uint64_t job_lo = r->lo, job_serial = r->storage_serial;
+    int mode = lazy_import_mode();
+    int prefetch = r->kind == POOL_IMPORT && r->istate == 1 && mode >= 2 && !(r->flags & NVN_MEMORY_POOL_FLAGS_SHADER_CODE) &&
+                   (mode == 3 ? !(r->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) : (r->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) != 0);
     plat_mutex_unlock(&pool_lock);
+    if (prefetch) import_prefetch(job_lo, job_serial);
     return 1;
 }
 
@@ -335,6 +459,10 @@ void vk_pool_fini(pool_t *p) {
     }
     plat_mutex_unlock(&pool_lock);
     if (!r) return;
+    if (r->kind == POOL_IMPORT) {   // an import in flight owns the record until it publishes state 0; one never started is dropped
+        while (__atomic_load_n(&r->istate, __ATOMIC_ACQUIRE) == 2) pool_import_wait();
+        __atomic_store_n(&r->istate, 0, __ATOMIC_RELAXED);
+    }
     // Texture lock is acquired only after releasing pool_lock. Descriptor lookup takes them in the other direction
     // (texture, then pool), just as normal image creation does. Imported aliases still alive preserve shared bytes.
     if (r->kind == POOL_IMPORT) vk_texture_descriptors_retire(r->lo, r->size, 0);
@@ -417,10 +545,12 @@ int vk_mem_inspect(uint64_t addr, uint64_t size, VkMemInspect *out) {
     if (!addr || !size || addr > UINT64_MAX - size) return 0;
     int ok = 0;
     VkMemInspect result = {0};
+retry:
     plat_mutex_lock_shared(&pool_lock);
     // Match bind_range's one-byte resolver candidate, then check the whole request against that same backing.
     const pidx_ent *e = pidx_find(&pool_index, addr, 1);
     const PoolRec *r = e ? e->buf : NULL;
+    if (r && pool_settle_locked((PoolRec *)r)) goto retry;
     if (!r || !r->size || r->lo > UINT64_MAX - r->size || addr < r->lo) goto done;
     uint64_t rel = addr - r->lo;
     if (rel >= r->size || size > r->size - rel) goto done;
@@ -531,10 +661,12 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
 
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
 static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
+retry:
     memset(out, 0, sizeof *out);
     plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
+    if (r && pool_settle_locked(r)) goto retry;   // not imported yet: done here, then looked up again
     int ok = 0;
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
