@@ -254,6 +254,7 @@ int vk_pool_init(pool_t *p) {
     // virtual pools that map it. Either gets device-local memory: 1.4.3's CPU never writes its 0x18c pool's storage
     // (unchanged over 3600 frames of the intro), so the guest storage and the GPU copy need no sync.
     if ((p->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS) && !(p->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL)) return 1;
+    double t0 = (double)plat_now_ms();
     PoolRec *r = calloc(1, sizeof *r);
     if (!r) rt_fatal("vk: out of memory for a pool record");
     r->key = p;
@@ -282,6 +283,11 @@ int vk_pool_init(pool_t *p) {
             ok = 1;
         }
     }
+    double took = (double)plat_now_ms() - t0;
+    if (took >= 20.0)   // a pool the driver needs long to back: the guest waits in MemoryPoolInitialize meanwhile
+        rt_log("vk: pool init took %.0f ms: %s pool of %llu MiB (flags %#x)", took,
+               r->kind == POOL_VIRT ? "virtual" : r->kind == POOL_PHYS ? "physical (device-local)" : "imported host memory",
+               (unsigned long long)(p->size >> 20), p->flags);
     if (!ok) { free(r->pt); free(r); return 0; }
     plat_mutex_lock(&pool_lock);
     if (!++storage_serial) ++storage_serial;
