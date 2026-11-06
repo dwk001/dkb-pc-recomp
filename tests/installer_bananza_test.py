@@ -166,6 +166,21 @@ assert '--full-build' in a and pathlib.Path(a[a.index('--expected')+1]).name=='e
         self.assertNotIn('dkb_data', [step for step, _ in self.calls])
         self.assertNotIn('lift', [step for step, _ in self.calls])
 
+    def test_shader_pipeline_library_crash_does_not_fail_the_step(self):
+        # A GPU driver crash building the pipeline library (lb_warm_prepared, reported against #79 on one NVIDIA
+        # driver) happens after --prepare-shaders already wrote shader-prepared.bin; the step must still finish, or
+        # every later run would hit the same crash and setup could never progress past it.
+        def crash(ctx, step, command):
+            if step == 'dkb_shaders' and str(command[-1]) == '--prepare-shaders':
+                (ctx.dest / 'shader-prepared.bin').write_bytes(b'synthetic shader-prepared pack')
+                raise b.InstallError('dkb.tool_failed', step=step, code=-11, log=str(self.temp / 'crash.log'))
+        code, events = self.run_install(crash)
+        self.assertEqual(code, 0, events)
+        warning = next(e for e in events if e['type'] == 'warning')
+        self.assertEqual(warning['id'], 'warn.dkb_shader_warm_failed')
+        self.assertEqual(warning['params']['code'], -11)
+        self.assertIn('dkb_shaders', b.statefile.load(self.dest, b.STATE)['steps'])
+
     def test_resume_recovers_sources_and_build_tools_from_state(self):
         self.assertEqual(self.run_install()[0], 0)
         self.options.exefs = self.options.romfs = self.options.translator = self.options.package = None

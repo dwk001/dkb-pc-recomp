@@ -591,6 +591,15 @@ class Shaders(Step):
                                 '--romfs', ctx.dest / 'romfs', '--out', ctx.dest])
         try:
             run_tool(ctx, self.id, [ctx.dest / ('dkb' + EXE), '--prepare-shaders'], cwd=ctx.dest)
+        except InstallError as e:
+            # --prepare-shaders (vk_pipeline_prepare_shaders) translates every stage first and writes
+            # shader-prepared.bin, then builds each variant's driver pipeline library (lb_warm_prepared): a crash
+            # in a GPU driver's shader compiler during that second half must not be able to fail this step, since
+            # every later run would hit the same crash and setup could never finish. The translations are not
+            # lost: the game builds any missing pipeline on first use instead, slower but not broken.
+            if not (ctx.dest / 'shader-prepared.bin').is_file():
+                raise
+            ctx.reporter.warning('warn.dkb_shader_warm_failed', code=e.params.get('code'), log=e.params.get('log'))
         finally:
             pack.unlink(missing_ok=True)
         return {'prepared': True}
